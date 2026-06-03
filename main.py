@@ -1,14 +1,21 @@
 """
-Startup Security Shield (S³) - PROFESSIONAL EDITION V7.0
-====================================================
-Enterprise-grade privacy protection with ENHANCED features:
-- Balanced risk scoring algorithm
-- Custom entity management with admin UI
-- Dynamic policy builder with custom weights
-- Advanced risk calculation with diminishing returns
+Startup Security Shield (S³)
+============================
+A PII detection and redaction middleware that scrubs sensitive data
+before it reaches third-party LLM APIs.
+
+Features:
+- Risk scoring with diminishing returns, diversity, and volume factors
+- Custom entity management with an admin UI
+- Policy builder with configurable weights
+- Optional LLM advisory that only ever sees anonymized data
+
+This is a working prototype, not a production deployment. See LEARNINGS.md
+for known limitations (detection accuracy is not yet benchmarked, storage is
+single-process SQLite, etc.).
 
 Author: Vishal
-Version: 7.0 (Enhanced Risk Scoring & Custom Policies)
+Version: 7.0
 """
 
 import os
@@ -48,13 +55,16 @@ from pydantic import BaseModel, Field, validator
 import httpx
 import jwt
 
+import s3_core
+
 try:
-    from passlib.context import CryptContext
-    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-    BCRYPT_AVAILABLE = True
-except:
-    BCRYPT_AVAILABLE = False
-    pwd_context = None
+    import bcrypt
+except ImportError as e:
+    # Fail loud: password security must not silently downgrade.
+    raise RuntimeError(
+        "The 'bcrypt' package is required for password hashing. "
+        "Install it with: pip install bcrypt"
+    ) from e
 
 try:
     from pypdf import PdfReader
@@ -110,55 +120,72 @@ class RiskLevel(str, Enum):
 # SECURITY CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", secrets.token_urlsafe(32))
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not JWT_SECRET_KEY:
+    JWT_SECRET_KEY = secrets.token_urlsafe(32)
+    logger.warning(
+        "JWT_SECRET_KEY is not set. Generated an ephemeral key for this process. "
+        "All tokens will be invalidated on restart and will not work across multiple "
+        "workers. Set JWT_SECRET_KEY in the environment for any real deployment."
+    )
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 def hash_password(password: str) -> str:
-    """Hash password using bcrypt or SHA256 fallback"""
-    if BCRYPT_AVAILABLE and pwd_context:
-        try:
-            return pwd_context.hash(password)
-        except:
-            pass
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Hash a password with bcrypt."""
+    # bcrypt only considers the first 72 bytes; truncate explicitly so newer
+    # bcrypt versions do not raise on longer input.
+    return bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify password"""
-    if BCRYPT_AVAILABLE and pwd_context:
-        try:
-            return pwd_context.verify(plain, hashed)
-        except:
-            pass
-    return hashlib.sha256(plain.encode()).hexdigest() == hashed
+    """Verify a password against its bcrypt hash."""
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8")[:72], hashed.encode("utf-8"))
+    except Exception:
+        return False
 
-# Enhanced demo users with roles
-DEMO_USERS = {
-    "demo": {
-        "username": "demo",
-        "hashed_password": hash_password("demo123"),
-        "role": UserRole.ANALYST,
-        "is_active": True
-    },
-    "admin": {
-        "username": "admin",
-        "hashed_password": hash_password("admin123"),
-        "role": UserRole.ADMIN,
-        "is_active": True
-    },
-    "viewer": {
-        "username": "viewer",
-        "hashed_password": hash_password("viewer123"),
-        "role": UserRole.VIEWER,
-        "is_active": True
-    },
-    "auditor": {
-        "username": "auditor",
-        "hashed_password": hash_password("auditor123"),
-        "role": UserRole.AUDITOR,
-        "is_active": True
-    }
-}
+# ──────────────────────────────────────────────────────────────────────────────
+# Demo accounts.
+#
+# These exist so the project can be tried locally without a user store. They are
+# DISABLED by default. To turn them on for a local demo, set ALLOW_DEMO_USERS=1.
+# Passwords can be overridden per account via environment variables; if you rely
+# on the built-in defaults a loud warning is logged. Never enable these in a
+# deployment that is reachable by anyone else.
+# ──────────────────────────────────────────────────────────────────────────────
+
+ALLOW_DEMO_USERS = os.getenv("ALLOW_DEMO_USERS", "0") == "1"
+
+_DEMO_ACCOUNT_DEFS = [
+    ("demo", "DEMO_PASSWORD", "demo123", UserRole.ANALYST),
+    ("admin", "ADMIN_PASSWORD", "admin123", UserRole.ADMIN),
+    ("viewer", "VIEWER_PASSWORD", "viewer123", UserRole.VIEWER),
+    ("auditor", "AUDITOR_PASSWORD", "auditor123", UserRole.AUDITOR),
+]
+
+DEMO_USERS = {}
+if ALLOW_DEMO_USERS:
+    _using_default_pw = False
+    for _name, _env_key, _default_pw, _role in _DEMO_ACCOUNT_DEFS:
+        _pw = os.getenv(_env_key)
+        if not _pw:
+            _pw = _default_pw
+            _using_default_pw = True
+        DEMO_USERS[_name] = {
+            "username": _name,
+            "hashed_password": hash_password(_pw),
+            "role": _role,
+            "is_active": True,
+        }
+    logger.warning(
+        "Demo accounts are ENABLED (ALLOW_DEMO_USERS=1). Disable them before "
+        "exposing this service to anyone else."
+    )
+    if _using_default_pw:
+        logger.warning(
+            "One or more demo accounts are using built-in default passwords. "
+            "Override them with the *_PASSWORD environment variables."
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENHANCED DATABASE SETUP
@@ -170,7 +197,13 @@ def init_database():
     """Initialize SQLite database with enhanced tables"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
+    # WAL allows concurrent reads during a write, and the busy timeout makes
+    # writers wait briefly for a lock instead of failing immediately. Both help
+    # under the rate-limited concurrency this service sees.
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
+
     # Scan history table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS scan_history (
@@ -252,43 +285,12 @@ def init_database():
     init_default_entity_risks()
 
 def init_default_entity_risks():
-    """Initialize default risk scores for entities"""
-    default_risks = {
-        # Critical Risk (35-50 base points)
-        "US_SSN": {"risk": 50.0, "level": RiskLevel.CRITICAL, "decay": 0.75, "desc": "Social Security Number - highest sensitivity"},
-        "CREDIT_CARD": {"risk": 45.0, "level": RiskLevel.CRITICAL, "decay": 0.75, "desc": "Payment card information"},
-        "PASSWORD": {"risk": 48.0, "level": RiskLevel.CRITICAL, "decay": 0.70, "desc": "Authentication credentials"},
-        "MEDICAL_LICENSE": {"risk": 42.0, "level": RiskLevel.CRITICAL, "decay": 0.75, "desc": "Protected health information"},
-        "US_PASSPORT": {"risk": 40.0, "level": RiskLevel.CRITICAL, "decay": 0.80, "desc": "Government identification"},
-        "US_BANK_NUMBER": {"risk": 43.0, "level": RiskLevel.CRITICAL, "decay": 0.75, "desc": "Financial account information"},
-        "CRYPTO": {"risk": 38.0, "level": RiskLevel.CRITICAL, "decay": 0.80, "desc": "Cryptocurrency wallet address"},
-        
-        # High Risk (20-34 base points)
-        "US_DRIVER_LICENSE": {"risk": 30.0, "level": RiskLevel.HIGH, "decay": 0.82, "desc": "State identification"},
-        "US_ITIN": {"risk": 32.0, "level": RiskLevel.HIGH, "decay": 0.80, "desc": "Individual Taxpayer ID"},
-        "IBAN_CODE": {"risk": 28.0, "level": RiskLevel.HIGH, "decay": 0.85, "desc": "International bank account"},
-        "EMAIL_ADDRESS": {"risk": 22.0, "level": RiskLevel.HIGH, "decay": 0.88, "desc": "Email contact information"},
-        "PHONE_NUMBER": {"risk": 20.0, "level": RiskLevel.HIGH, "decay": 0.88, "desc": "Phone contact information"},
-        "IP_ADDRESS": {"risk": 25.0, "level": RiskLevel.HIGH, "decay": 0.85, "desc": "Network identifier"},
-        "UK_NHS": {"risk": 33.0, "level": RiskLevel.HIGH, "decay": 0.80, "desc": "NHS number (UK healthcare)"},
-        "EMPLOYEE_ID": {"risk": 24.0, "level": RiskLevel.HIGH, "decay": 0.86, "desc": "Employee identification"},
-        
-        # Medium Risk (10-19 base points)
-        "DATE_TIME": {"risk": 12.0, "level": RiskLevel.MEDIUM, "decay": 0.90, "desc": "Date of birth or temporal data"},
-        "LOCATION": {"risk": 15.0, "level": RiskLevel.MEDIUM, "decay": 0.88, "desc": "Physical address or location"},
-        "PERSON": {"risk": 14.0, "level": RiskLevel.MEDIUM, "decay": 0.88, "desc": "Personal name"},
-        "USERNAME": {"risk": 16.0, "level": RiskLevel.MEDIUM, "decay": 0.87, "desc": "Account username"},
-        "VEHICLE_INFO": {"risk": 18.0, "level": RiskLevel.MEDIUM, "decay": 0.86, "desc": "Vehicle or license plate"},
-        
-        # Low Risk (5-9 base points)
-        "URL": {"risk": 6.0, "level": RiskLevel.LOW, "decay": 0.92, "desc": "Web address"},
-    }
-    
+    """Seed the entity_risk_config table from the canonical defaults in s3_core."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
-        for entity_type, config in default_risks.items():
+
+        for entity_type, config in s3_core.DEFAULT_ENTITY_RISKS.items():
             cursor.execute("""
                 INSERT OR REPLACE INTO entity_risk_config 
                 (entity_type, base_risk_score, risk_level, decay_factor, description, updated_at)
@@ -296,12 +298,12 @@ def init_default_entity_risks():
             """, (
                 entity_type,
                 config["risk"],
-                config["level"].value,
+                config["level"],
                 config["decay"],
                 config["desc"],
                 datetime.now().isoformat()
             ))
-        
+
         conn.commit()
         conn.close()
         logger.info("Default entity risk configurations initialized")
@@ -345,12 +347,12 @@ def initialize_entity_risk_cache():
     except Exception as e:
         logger.error(f"Failed to initialize entity risk cache: {e}")
 
-# Initialize cache on startup
-initialize_entity_risk_cache()
-
-
-# Initialize database on startup
+# Order matters: the database (and its seeded entity_risk_config rows) must
+# exist before the cache reads them. Loading the cache first leaves it empty on
+# a fresh database, which makes every entity fall back to the default weight
+# until the next restart.
 init_database()
+initialize_entity_risk_cache()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENHANCED PYDANTIC MODELS
@@ -393,11 +395,14 @@ class CustomEntityCreate(BaseModel):
     
     @validator('pattern')
     def validate_pattern(cls, v):
-        try:
-            re.compile(v)
-            return v
-        except re.error:
+        if not s3_core.is_valid_regex(v):
             raise ValueError("Invalid regex pattern")
+        if s3_core.is_dangerous_regex(v):
+            raise ValueError(
+                "Pattern rejected: nested quantifiers can cause catastrophic "
+                "backtracking (ReDoS)"
+            )
+        return v
 
 class CustomEntityUpdate(BaseModel):
     """Model for updating custom entities"""
@@ -667,127 +672,26 @@ def get_entity_risk_config(entity_type: str) -> Dict[str, Any]:
     logger.info(f"⚠️ Unknown entity '{entity_type}' - using default config")
     return default_config
 
-def calculate_risk_score_enhanced(entities: List[RecognizerResult], 
+def calculate_risk_score_enhanced(entities: List[RecognizerResult],
                                   compliance: ComplianceFramework = None,
                                   custom_weights: Dict[str, float] = None) -> Dict[str, Any]:
     """
-    ENHANCED risk scoring with balanced, realistic calculations
-    
-    Algorithm features:
-    1. Diminishing returns: Each additional instance of same entity type has reduced impact
-    2. Diversity penalty: Multiple entity types increase risk more than duplicates
-    3. Confidence weighting: Higher confidence scores contribute more to risk
-    4. Volume normalization: Prevents instant 100 score with many entities
-    5. Compliance-aware: Adjusts weights based on regulatory framework
-    
-    Returns dict with: score (0-100), breakdown, level, and contributing factors
+    Risk scoring wrapper.
+
+    The actual algorithm lives in s3_core.calculate_risk_score, which is pure
+    and unit-tested. This wrapper supplies the cache-backed risk lookup and the
+    compliance high-risk list, then returns the core result unchanged.
     """
-    
-    if not entities:
-        return {
-            "score": 0,
-            "level": "safe",
-            "breakdown": {},
-            "diversity_score": 0,
-            "volume_factor": 0,
-            "compliance_adjusted": False
-        }
-    
-    # Group entities by type with their confidence scores
-    entity_groups = {}
-    for entity in entities:
-        etype = entity.entity_type
-        confidence = entity.score
-        
-        if etype not in entity_groups:
-            entity_groups[etype] = []
-        entity_groups[etype].append(confidence)
-    
-    # OPTIMIZED: Get all configs in single pass and store both risk and decay
-    entity_risks = {}
-    decay_factors = {}
-    
-    for etype in entity_groups.keys():
-        if custom_weights and etype in custom_weights:
-            entity_risks[etype] = custom_weights[etype]
-            decay_factors[etype] = 0.85  # Default decay for custom weights
-        else:
-            config = get_entity_risk_config(etype)  # Now uses cache - super fast!
-            entity_risks[etype] = config["base_risk"]
-            decay_factors[etype] = config["decay"]  # Store decay factor here
-    
-    # Apply compliance framework adjustments
+    high_risk = None
     if compliance and compliance in COMPLIANCE_CONFIGS:
-        config = COMPLIANCE_CONFIGS[compliance]
-        for etype in entity_groups.keys():
-            if etype in config.get("high_risk", []):
-                entity_risks[etype] *= 1.3  # 30% increase for compliance-critical entities
-    
-    # Calculate risk with diminishing returns
-    total_risk = 0
-    breakdown = {}
-    
-    for etype, confidences in entity_groups.items():
-        base_risk = entity_risks.get(etype, 10.0)
-        decay_factor = decay_factors.get(etype, 0.90)  # Use cached decay factor
-        
-        # Sort confidences descending for diminishing returns
-        confidences.sort(reverse=True)
-        
-        entity_contribution = 0
-        for i, confidence in enumerate(confidences):
-            # Diminishing returns: each instance contributes less
-            # Formula: base_risk * confidence * (decay_factor ^ instance_number)
-            contribution = base_risk * confidence * (decay_factor ** i)
-            entity_contribution += contribution
-        
-        breakdown[etype] = {
-            "count": len(confidences),
-            "contribution": round(entity_contribution, 2),
-            "base_risk": base_risk,
-            "avg_confidence": round(sum(confidences) / len(confidences), 3)
-        }
-        
-        total_risk += entity_contribution
-    
-    # Diversity multiplier: Having many different entity types is riskier
-    num_types = len(entity_groups)
-    diversity_multiplier = 1.0 + (math.log(num_types + 1) * 0.15)  # Logarithmic growth
-    
-    # Volume factor: Total number of entities (with soft cap)
-    total_count = len(entities)
-    volume_factor = 1.0 + (math.log(total_count + 1) * 0.10)
-    
-    # Apply multipliers
-    adjusted_risk = total_risk * diversity_multiplier * volume_factor
-    
-    # Normalize to 0-100 scale with soft ceiling
-    # Using sigmoid-like function to prevent hard caps
-    final_score = 100 * (1 - math.exp(-adjusted_risk / 100))
-    final_score = min(final_score, 99.5)  # Soft cap at 99.5
-    
-    # Determine risk level
-    if final_score >= 80:
-        level = "critical"
-    elif final_score >= 60:
-        level = "high"
-    elif final_score >= 35:
-        level = "medium"
-    elif final_score >= 15:
-        level = "low"
-    else:
-        level = "minimal"
-    
-    return {
-        "score": round(final_score, 1),
-        "level": level,
-        "breakdown": breakdown,
-        "diversity_score": round(diversity_multiplier, 2),
-        "volume_factor": round(volume_factor, 2),
-        "entity_types_count": num_types,
-        "total_entities": total_count,
-        "compliance_adjusted": compliance is not None
-    }
+        high_risk = COMPLIANCE_CONFIGS[compliance].get("high_risk", [])
+
+    return s3_core.calculate_risk_score(
+        entities,
+        get_risk_config=get_entity_risk_config,
+        high_risk_entities=high_risk,
+        custom_weights=custom_weights,
+    )
 
 def make_decision_enhanced(entities: List[RecognizerResult], role: str = "user", 
                           compliance: ComplianceFramework = None,
@@ -829,17 +733,9 @@ def make_decision_enhanced(entities: List[RecognizerResult], role: str = "user",
         if any(e.entity_type in ["PERSON", "EMAIL_ADDRESS", "IP_ADDRESS"] for e in entities):
             reasons.append("GDPR: Personal data detected - consent and right to erasure apply")
     
-    # Make decision based on risk score and threshold
-    if risk_score >= 80:
-        return "block", reasons + [f"CRITICAL RISK (score: {risk_score}/100) - Immediate action required"]
-    elif risk_score >= max(risk_threshold, 60):
-        return "review", reasons + [f"HIGH RISK (score: {risk_score}/100) - Manual review mandatory"]
-    elif risk_score >= max(risk_threshold * 0.7, 35):
-        return "warn", reasons + [f"MODERATE RISK (score: {risk_score}/100) - Proceed with caution"]
-    elif risk_score >= 15:
-        return "caution", reasons + [f"LOW RISK (score: {risk_score}/100) - Standard precautions apply"]
-    else:
-        return "allow", reasons + [f"MINIMAL RISK (score: {risk_score}/100) - Safe to proceed"]
+    # Make decision based on risk score and threshold (mapping lives in s3_core)
+    decision, severity_reason = s3_core.decide_from_score(risk_score, risk_threshold)
+    return decision, reasons + [severity_reason]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CUSTOM ENTITY MANAGEMENT
@@ -973,8 +869,8 @@ initialize_custom_entities()
 # ══════════════════════════════════════════════════════════════════════════════
 
 app = FastAPI(
-    title="Startup Security Shield (S³) - Professional Edition V7.0",
-    description="Enterprise-grade PII detection with enhanced risk scoring and custom entity management",
+    title="Startup Security Shield (S³)",
+    description="PII detection and redaction middleware with risk scoring and custom entity management (prototype)",
     version="7.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -986,13 +882,20 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-# CORS
+# CORS.
+# A wildcard origin combined with credentials is both insecure and rejected by
+# browsers, so the allowed origins are read from an explicit allowlist instead.
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Security headers middleware
@@ -1003,7 +906,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["Content-Security-Policy"] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com"
+        # 'unsafe-inline' is still required because the UI is served as a single
+        # file with inline <script>, inline styles, and inline event handlers.
+        # Removing it means moving that JS/CSS into separate static assets, which
+        # is the right next step. 'unsafe-eval' is not needed and has been dropped.
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self' 'unsafe-inline' "
+            "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com"
+        )
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         return response
 
@@ -1037,13 +947,14 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     return encoded_jwt
 
 def decode_token(token: str) -> Dict:
-    """Decode JWT token"""
+    """Decode and validate a JWT, raising 401 on any problem."""
     try:
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Token has expired")
-    except jwt.JWTError:
+    except jwt.InvalidTokenError:
+        # Covers malformed, tampered, and otherwise invalid tokens in PyJWT.
         raise HTTPException(401, "Invalid token")
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> User:
@@ -1058,15 +969,23 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     
     return User(username=username, role=UserRole(role))
 
-def require_role(*allowed_roles: UserRole):
-    """Decorator to require specific roles"""
-    def decorator(func):
-        async def wrapper(*args, user: User = Depends(get_current_user), **kwargs):
-            if user.role not in allowed_roles:
-                raise HTTPException(403, f"Insufficient permissions. Required: {', '.join(r.value for r in allowed_roles)}")
-            return await func(*args, user=user, **kwargs)
-        return wrapper
-    return decorator
+def require_roles(*allowed_roles: UserRole):
+    """
+    FastAPI dependency factory enforcing role-based access.
+
+    Usage:
+        @app.post("/thing")
+        async def thing(user: User = Depends(require_roles(UserRole.ADMIN))):
+            ...
+
+    Returns the authenticated user when their role is allowed, otherwise 403.
+    """
+    async def dependency(user: User = Depends(get_current_user)) -> User:
+        if user.role not in allowed_roles:
+            allowed = ", ".join(r.value for r in allowed_roles)
+            raise HTTPException(403, f"Insufficient permissions. Required role: {allowed}")
+        return user
+    return dependency
 
 def log_audit(action: str, username: str, details: Dict[str, Any], ip_address: str = "unknown"):
     """Log audit trail to database"""
@@ -1271,15 +1190,22 @@ async def call_privacy_advisor(text: str, entities: List[RecognizerResult],
     if doc_type_hints:
         doc_context = f"\n**Likely Document Type:** {' or '.join(doc_type_hints)}\n"
     
-    # Build sample snippets (anonymized)
-    sample_context = "\n**Sample Context from Document:**\n"
-    text_preview = text[:300] + "..." if len(text) > 300 else text
-    # Anonymize the preview for the LLM
-    for entity in entities[:5]:  # Just first 5 to keep prompt concise
-        text_preview = text_preview.replace(
-            text[entity.start:entity.end], 
-            f"<{entity.entity_type}>"
+    # Build the sample snippet from a FULLY anonymized copy of the text.
+    # Every detected span is replaced by offset (processed end-first so earlier
+    # offsets stay valid). The previous version only masked the first five
+    # entities and matched by value, which could leak raw PII to the LLM.
+    anonymized_full = text
+    for entity in sorted(entities, key=lambda e: e.start, reverse=True):
+        anonymized_full = (
+            anonymized_full[:entity.start]
+            + f"<{entity.entity_type}>"
+            + anonymized_full[entity.end:]
         )
+
+    sample_context = "\n**Sample Context from Document:**\n"
+    text_preview = anonymized_full[:300]
+    if len(anonymized_full) > 300:
+        text_preview += "..."
     sample_context += f"```\n{text_preview}\n```\n"
     
     # Build the comprehensive prompt
@@ -1425,7 +1351,7 @@ async def process_file_upload(file: UploadFile) -> Tuple[str, str]:
 
 @app.get("/", response_class=HTMLResponse, tags=["UI"])
 async def root():
-    """Serve the main UI - Enhanced Professional Edition"""
+    """Serve the main UI."""
     return HTMLResponse(content=UI_HTML, status_code=200)
 
 @app.get("/health", tags=["System"])
@@ -1434,15 +1360,14 @@ async def health_check():
     return {
         "status": "healthy",
         "version": "7.0",
-        "edition": "Professional Enhanced",
         "timestamp": datetime.now().isoformat(),
         "features": {
             "pdf_support": PDF_ENABLED,
             "llm_enabled": LLM_ENABLED,
-            "bcrypt": BCRYPT_AVAILABLE,
+            "demo_users_enabled": ALLOW_DEMO_USERS,
             "database": True,
             "custom_entities": True,
-            "enhanced_risk_scoring": True
+            "risk_scoring": True
         }
     }
 
@@ -1450,37 +1375,86 @@ async def health_check():
 # API ENDPOINTS - AUTHENTICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Brute-force protection. After too many failed attempts for a given
+# username+IP, that pair is locked out for a cooldown window. This is in-memory,
+# so it resets on restart and is per-process; a shared store (Redis) would be
+# the next step for a multi-worker deployment.
+MAX_FAILED_LOGINS = int(os.getenv("MAX_FAILED_LOGINS", "5"))
+LOGIN_LOCKOUT_MINUTES = int(os.getenv("LOGIN_LOCKOUT_MINUTES", "15"))
+_FAILED_LOGINS: Dict[str, Dict[str, Any]] = {}
+
+
+def _login_key(username: str, ip: str) -> str:
+    return f"{username}:{ip}"
+
+
+def login_locked_until(key: str) -> Optional[datetime]:
+    """Return the unlock time if this key is currently locked, else None."""
+    rec = _FAILED_LOGINS.get(key)
+    if rec and rec.get("locked_until") and rec["locked_until"] > datetime.utcnow():
+        return rec["locked_until"]
+    return None
+
+
+def record_login_failure(key: str) -> Optional[datetime]:
+    """Count a failure; lock the key and return the unlock time once over the limit."""
+    rec = _FAILED_LOGINS.setdefault(key, {"count": 0, "locked_until": None})
+    rec["count"] += 1
+    if rec["count"] >= MAX_FAILED_LOGINS:
+        rec["locked_until"] = datetime.utcnow() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)
+        rec["count"] = 0
+        return rec["locked_until"]
+    return None
+
+
+def reset_login_failures(key: str) -> None:
+    _FAILED_LOGINS.pop(key, None)
+
+
 @app.post("/auth/login", response_model=Token, tags=["Authentication"])
 @limiter.limit("5/minute")
 async def login(request: Request, login_data: LoginRequest):
     """
-    Login endpoint - returns JWT token
-    
-    Demo credentials:
-    - viewer / viewer123 (View only)
-    - demo / demo123 (Analyst)
-    - admin / admin123 (Full access)
-    - auditor / auditor123 (Audit access)
+    Login endpoint - returns a JWT token.
+
+    Demo accounts are disabled by default. Set ALLOW_DEMO_USERS=1 to enable them
+    for local use (demo/admin/viewer/auditor). Override the passwords with the
+    *_PASSWORD environment variables.
     """
-    
+
+    client_ip = request.client.host if request.client else "unknown"
+    key = _login_key(login_data.username, client_ip)
+
+    locked_until = login_locked_until(key)
+    if locked_until:
+        minutes = max(int((locked_until - datetime.utcnow()).total_seconds()) // 60, 1)
+        log_audit("login_locked", login_data.username, {"lock_minutes": minutes}, client_ip)
+        raise HTTPException(429, f"Too many failed attempts. Try again in about {minutes} minute(s).")
+
     user_data = DEMO_USERS.get(login_data.username)
-    
+
     if not user_data or not verify_password(login_data.password, user_data["hashed_password"]):
+        locked = record_login_failure(key)
         logger.warning(f"Failed login attempt for user: {login_data.username}")
-        log_audit("login_failed", login_data.username, {"reason": "invalid_credentials"}, request.client.host)
+        log_audit("login_failed", login_data.username, {"reason": "invalid_credentials"}, client_ip)
+        if locked:
+            raise HTTPException(429, "Too many failed attempts. Account temporarily locked.")
         raise HTTPException(401, "Incorrect username or password")
-    
+
     if not user_data["is_active"]:
         raise HTTPException(403, "User account is inactive")
-    
+
+    # Successful login clears the failure counter.
+    reset_login_failures(key)
+
     # Create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user_data["username"], "role": user_data["role"]},
         expires_delta=access_token_expires
     )
-    
-    log_audit("login_success", login_data.username, {"role": user_data["role"]}, request.client.host)
+
+    log_audit("login_success", login_data.username, {"role": user_data["role"]}, client_ip)
     logger.info(f"Successful login for user: {login_data.username}")
     
     return {
@@ -1508,13 +1482,10 @@ async def verify_token(user: User = Depends(get_current_user)):
 async def create_custom_entity(
     request: Request,
     entity: CustomEntityCreate,
-    user: User = Depends(get_current_user)
+    user: User = Depends(require_roles(UserRole.ADMIN))
 ):
     """Create a new custom PII entity (Admin only)"""
-    
-    if user.role != UserRole.ADMIN:
-        raise HTTPException(403, "Only admins can create custom entities")
-    
+
     try:
         entity_id = register_custom_entity(entity, user.username)
         
@@ -1600,13 +1571,10 @@ async def update_custom_entity(
     request: Request,
     entity_id: int,
     updates: CustomEntityUpdate,
-    user: User = Depends(get_current_user)
+    user: User = Depends(require_roles(UserRole.ADMIN))
 ):
     """Update a custom entity (Admin only)"""
-    
-    if user.role != UserRole.ADMIN:
-        raise HTTPException(403, "Only admins can update custom entities")
-    
+
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -1673,13 +1641,10 @@ async def update_custom_entity(
 async def delete_custom_entity(
     request: Request,
     entity_id: int,
-    user: User = Depends(get_current_user)
+    user: User = Depends(require_roles(UserRole.ADMIN))
 ):
     """Soft delete a custom entity (Admin only)"""
-    
-    if user.role != UserRole.ADMIN:
-        raise HTTPException(403, "Only admins can delete custom entities")
-    
+
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -1826,7 +1791,6 @@ async def redact_file(
     request: Request,
     file: UploadFile = File(...),
     advisor: bool = False,
-    role: str = "user",
     compliance: ComplianceFramework = ComplianceFramework.CUSTOM,
     user: User = Depends(get_current_user)
 ):
@@ -1835,7 +1799,9 @@ async def redact_file(
     """
     
     start_time = time.time()
-    
+    # Role comes from the authenticated token, never from the request body.
+    role = user.role.value
+
     logger.info(f"File upload from user {user.username}: {file.filename} | Advisor: {advisor} | Compliance: {compliance}")
     
     try:
@@ -2166,13 +2132,13 @@ async def get_scan_history(
 @app.on_event("startup")
 async def startup_diagnostics():
     logger.info("=" * 70)
-    logger.info("Startup Security Shield v6.0 - PROFESSIONAL EDITION")
+    logger.info("Startup Security Shield (S³) v7.0")
     logger.info("=" * 70)
-    logger.info("Features: Enhanced")
     logger.info(f"Presidio: LOADED")
     logger.info(f"PDF Support: {'ENABLED' if PDF_ENABLED else 'DISABLED'}")
     logger.info(f"MIME Detection: {'ENABLED' if MAGIC_ENABLED else 'DISABLED'}")
-    logger.info(f"Bcrypt Hashing: {'ENABLED' if BCRYPT_AVAILABLE else 'FALLBACK (SHA256)'}")
+    logger.info(f"Password Hashing: bcrypt")
+    logger.info(f"Demo Accounts: {'ENABLED' if ALLOW_DEMO_USERS else 'DISABLED'}")
     logger.info(f"Database: SQLite ({DB_PATH})")
     
     logger.info("=" * 70)
@@ -2194,24 +2160,14 @@ async def startup_diagnostics():
     
     logger.info("=" * 70)
     logger.info("Server: http://127.0.0.1:8000")
-    logger.info("Dashboard: http://127.0.0.1:8000/ui")
+    logger.info("Dashboard: http://127.0.0.1:8000/")
     logger.info("API Docs: http://127.0.0.1:8000/docs")
     logger.info("=" * 70)
-    logger.info("")
-    logger.info("DEMO CREDENTIALS:")
-    logger.info("  viewer / viewer123 (View Only)")
-    logger.info("  demo / demo123 (Analyst)")
-    logger.info("  admin / admin123 (Full Access)")
-    logger.info("  auditor / auditor123 (Audit Access)")
-    logger.info("")
-    logger.info("NEW FEATURES:")
-    logger.info("  ✓ Interactive Charts & Analytics")
-    logger.info("  ✓ Compliance Framework Templates")
-    logger.info("  ✓ Role-Based Access Control")
-    logger.info("  ✓ Custom Redaction Policies")
-    logger.info("  ✓ Dark/Light Mode")
-    logger.info("  ✓ Persistent Database")
-    logger.info("  ✓ Enhanced Audit Trail")
+    if ALLOW_DEMO_USERS:
+        logger.info("")
+        logger.info("Demo accounts are enabled. Log in with the accounts named")
+        logger.info("demo / admin / viewer / auditor using the configured passwords")
+        logger.info("(*_PASSWORD env vars, or the built-in defaults if unset).")
     logger.info("=" * 70)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2228,7 +2184,7 @@ UI_HTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Startup Security Shield - Professional Edition</title>
+<title>Startup Security Shield (S³)</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root[data-theme="dark"] {
@@ -2732,23 +2688,20 @@ pre{
       <span id="themeIcon">🌙</span>
       <span id="themeText">Dark Mode</span>
     </button>
-    <h1>🛡️ Startup Security Shield<span class="version">v6.0 PRO</span></h1>
-    <p>Enterprise-Grade PII Detection & Redaction Platform</p>
+    <h1>🛡️ Startup Security Shield<span class="version">v7.0</span></h1>
+    <p>PII Detection & Redaction Middleware</p>
   </div>
 
   <div class="auth-section" id="authSection">
     <h2 style="margin-bottom:20px;color:var(--accent-blue)">🔐 Authentication</h2>
     <div class="auth-form">
-      <input type="text" id="username" placeholder="Username" value="demo"/>
-      <input type="password" id="password" placeholder="Password" value="demo123"/>
+      <input type="text" id="username" placeholder="Username"/>
+      <input type="password" id="password" placeholder="Password"/>
       <button class="button button-primary" onclick="doLogin()">Login</button>
     </div>
     <div class="auth-info">
-      <strong>Demo Accounts:</strong><br>
-      <code>viewer/viewer123</code> (View Only) | 
-      <code>demo/demo123</code> (Analyst) |
-      <code>admin/admin123</code> (Full Access) |
-      <code>auditor/auditor123</code> (Audit)
+      Sign in with your account. If demo accounts are enabled on this instance
+      (ALLOW_DEMO_USERS=1), use the credentials provided by whoever set it up.
     </div>
   </div>
 
@@ -3187,8 +3140,8 @@ function doLogout(){
   CURRENT_ROLE = "";
   $("authSection").classList.remove("hidden");
   $("mainApp").classList.add("hidden");
-  $("username").value = "demo";
-  $("password").value = "demo123";
+  $("username").value = "";
+  $("password").value = "";
 }
 
 async function doRedact(useAdvisor){
@@ -3822,8 +3775,6 @@ dz.addEventListener("drop",ev=>{
 </body>
 </html>
 """
-
-
 
 if __name__ == "__main__":
     import uvicorn
